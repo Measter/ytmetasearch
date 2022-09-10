@@ -31,10 +31,16 @@ struct Query {
     expressions: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct Management {
     c_files: Vec<PathBuf>,
     c_lines: u64,
+}
+
+struct Output {
+    files: Vec<BufWriter<File>>,
+    management: Management,
+    management_file: PathBuf,
 }
 
 fn search_line(line: &str, queries: &[AhoCorasick], does_match: &mut [bool]) {
@@ -45,15 +51,14 @@ fn search_line(line: &str, queries: &[AhoCorasick], does_match: &mut [bool]) {
 
 fn search_file(
     management: &Management,
-    mut sub_management: Management,
     file_path: &PathBuf,
     queries: &[Query],
     searchers: &[AhoCorasick],
-    output_files_mutex: &Mutex<Vec<BufWriter<File>>>,
-) -> Management {
+    output_data: &Mutex<Output>,
+) {
     if management.c_files.contains(file_path) {
         println!("Skipping file {} (completed)", file_path.display());
-        return sub_management;
+        return;
     }
 
     println!("Searching {}...", file_path.display());
@@ -63,14 +68,14 @@ fn search_file(
         Ok(f) => f,
         Err(e) => {
             eprintln!("Error opening {}: {e}", file_path.display());
-            return sub_management;
+            return;
         }
     };
     let mut reader = match Decoder::new(file) {
         Ok(r) => BufReader::new(r),
         Err(e) => {
             eprintln!("Error opening {}: {e}", file_path.display());
-            return sub_management;
+            return;
         }
     };
 
@@ -92,7 +97,7 @@ fn search_file(
             Ok(_) => {}
             Err(e) => {
                 eprintln!("Error reading {}: {e}", file_path.display());
-                return sub_management;
+                return;
             }
         }
 
@@ -107,9 +112,10 @@ fn search_file(
         }
 
         if match_count == 1000 {
-            if write_matches(&matches, queries, output_files_mutex).is_err() {
+            let mut lock = output_data.lock().unwrap();
+            if write_matches(&matches, queries, &mut lock.files).is_err() {
                 // Return here, so that it doesn't get marked as complete.
-                return sub_management;
+                return;
             }
             matches.iter_mut().for_each(|c| c.clear());
             match_count = 0;
@@ -118,28 +124,40 @@ fn search_file(
         line_count += 1;
     }
 
-    if match_count > 0 && write_matches(&matches, queries, output_files_mutex).is_err() {
+    let mut lock = output_data.lock().unwrap();
+
+    if match_count > 0 && write_matches(&matches, queries, &mut lock.files).is_err() {
         // Return here, so that it doesn't get marked as complete.
-        return sub_management;
+        return;
     }
 
     // We've now finished searching this file, update the management.
-    sub_management.c_files.push(file_path.clone());
-    sub_management.c_lines += line_count;
+    lock.management.c_files.push(file_path.clone());
+    lock.management.c_lines += line_count;
 
     let elapsed = now.elapsed();
     println!("Took {elapsed:?} to search {line_count} lines, found {found_count} results",);
 
-    sub_management
+    // Now write out the management.
+    let rendered = match serde_json::to_string_pretty(&lock.management) {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("Error rendering management file");
+            return;
+        }
+    };
+
+    if std::fs::write(&lock.management_file, &rendered).is_err() {
+        eprintln!("Error writing management file");
+    }
 }
 
 fn write_matches(
     matches: &[Vec<String>],
     queries: &[Query],
-    output_files: &Mutex<Vec<BufWriter<File>>>,
+    output_files: &mut [BufWriter<File>],
 ) -> Result<(), ()> {
-    let mut output_files = output_files.lock().unwrap();
-    for ((matches, query), output_file) in matches.iter().zip(queries).zip(&mut *output_files) {
+    for ((matches, query), output_file) in matches.iter().zip(queries).zip(output_files) {
         if matches.is_empty() {
             continue;
         }
@@ -189,13 +207,19 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&args.output_dir)
         .with_context(|| anyhow!("Error creating output directory"))?;
 
-    let mut management = if args.management_file.exists() {
+    let management = if args.management_file.exists() {
         let contents = std::fs::read_to_string(&args.management_file)
             .with_context(|| anyhow!("Error opening management file"))?;
         serde_json::from_str(&contents).with_context(|| anyhow!("Error parsing management file"))?
     } else {
         Management::default()
     };
+
+    // Ensure the folder exists if the management path has a parent.
+    if let Some(parent) = args.management_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| anyhow!("Error creating parent directory for management file"))?;
+    }
 
     let mut output_files = Vec::new();
     for query in &queries {
@@ -208,42 +232,21 @@ fn main() -> Result<()> {
         output_files.push(BufWriter::new(file));
     }
 
-    let output_files_mutex = Mutex::new(output_files);
+    let output_files_mutex = Mutex::new(Output {
+        files: output_files,
+        management: management.clone(),
+        management_file: args.management_file,
+    });
 
-    let new_management = zstd_files
-        .par_iter()
-        .fold(Management::default, |sub_management, file_path| {
-            search_file(
-                &management,
-                sub_management,
-                file_path,
-                &queries,
-                &searchers,
-                &output_files_mutex,
-            )
-        })
-        .reduce(Management::default, |mut sum, cur| {
-            sum.c_files.extend(cur.c_files);
-            sum.c_lines += cur.c_lines;
-            sum
-        });
-
-    // Merge the new management with the old.
-    management.c_files.extend(new_management.c_files);
-    management.c_lines += new_management.c_lines;
-
-    // Now write out the management.
-    let rendered = serde_json::to_string_pretty(&management)
-        .with_context(|| anyhow!("Error rendering management JSON"))?;
-
-    // Ensure the folder exists if the path has a parent.
-    if let Some(parent) = args.management_file.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| anyhow!("Error creating parent directory for management file"))?;
-    }
-
-    std::fs::write(&args.management_file, &rendered)
-        .with_context(|| anyhow!("Error writing management file"))?;
+    zstd_files.par_iter().for_each(|file_path| {
+        search_file(
+            &management,
+            file_path,
+            &queries,
+            &searchers,
+            &output_files_mutex,
+        )
+    });
 
     Ok(())
 }
