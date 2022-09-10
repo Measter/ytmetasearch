@@ -106,9 +106,13 @@ fn search_file(
             }
         }
 
-        if match_count == 1000 && write_matches(&matches, queries, output_files_mutex).is_err() {
-            // Return here, so that it doesn't get marked as complete.
-            return sub_management;
+        if match_count == 1000 {
+            if write_matches(&matches, queries, output_files_mutex).is_err() {
+                // Return here, so that it doesn't get marked as complete.
+                return sub_management;
+            }
+            matches.iter_mut().for_each(|c| c.clear());
+            match_count = 0;
         }
 
         line_count += 1;
