@@ -1,5 +1,5 @@
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
     sync::Mutex,
@@ -200,7 +200,10 @@ fn main() -> Result<()> {
     let mut output_files = Vec::new();
     for query in &queries {
         let path = args.output_dir.join(&query.filename);
-        let file = File::create(&path)
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&path)
             .with_context(|| anyhow!("Error creating output file {}", path.display()))?;
         output_files.push(BufWriter::new(file));
     }
